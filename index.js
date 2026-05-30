@@ -2,218 +2,183 @@ require('dotenv').config();
 const { Client, GatewayIntentBits, EmbedBuilder, Colors } = require('discord.js');
 const axios = require('axios');
 
-// ─────────────────────────────────────────────
-//  Config
-// ─────────────────────────────────────────────
-const VIOV_API  = 'https://apiv1.vio-v.com/api/v3';
-const TOKEN_URL   = 'https://apiv1.vio-v.com/api/oauth2/token';
+const API_BASE  = 'https://apiv1.vio-v.com/api/v3';
+const TOKEN_URL = 'https://apiv1.vio-v.com/api/oauth2/token';
 
-const NEXT_CAPTURE = 1779831330;
+let accessToken    = null;
+let tokenExpiresAt = 0;
 
-// ─────────────────────────────────────────────
-//  State
-// ─────────────────────────────────────────────
-let accessToken       = null;
-let tokenExpiresAt    = 0;
-
-const factoryState    = new Map();
+// Map: factoryId → { ts, attacked }
+// attacked = true wenn nextCapture bereits in der Vergangenheit war
+const knownState = new Map();
 
 let statusMessage     = null;
+let lastSuccessfulPoll = Date.now();
+let ownerPinged        = false; // verhindert Spam
 
-// ─────────────────────────────────────────────
-//  Discord client
-// ─────────────────────────────────────────────
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-// ─────────────────────────────────────────────
-//  OAuth2 – Client Credentials Grant
-// ─────────────────────────────────────────────
+// ── OAuth2 Token ──────────────────────────────────────────────────────────────
 async function getAccessToken() {
   const now = Date.now() / 1000;
   if (accessToken && now < tokenExpiresAt - 30) return accessToken;
 
-  const params = new URLSearchParams();
-  params.append('grant_type', 'client_credentials');
-  params.append('client_id',     process.env.VIOV_CLIENT_ID);
-  params.append('client_secret', process.env.VIOV_CLIENT_SECRET);
-  params.append('scope', 'read.group');
-
-  const res = await axios.post(TOKEN_URL, params, {
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+  const body = new URLSearchParams({
+    grant_type:    'client_credentials',
+    client_id:     process.env.VIOV_CLIENT_ID,
+    client_secret: process.env.VIOV_CLIENT_SECRET,
+    scope:         'read.group',
   });
 
+  const res      = await axios.post(TOKEN_URL, body);
   accessToken    = res.data.access_token;
-  tokenExpiresAt = now + (res.data.expires_in || 3600);
+  tokenExpiresAt = now + (res.data.expires_in ?? 3600);
   console.log('[Auth] Token erneuert.');
   return accessToken;
 }
 
-// ─────────────────────────────────────────────
-//  VioV API – Fabriken abrufen
-// ─────────────────────────────────────────────
+// ── API ───────────────────────────────────────────────────────────────────────
 async function fetchFactories() {
   const token = await getAccessToken();
-  const res = await axios.get(`${VIOV_API}/group/factories`, {
-    headers: { Authorization: `Bearer ${token}` }
+  const res   = await axios.get(`${API_BASE}/group/factories`, {
+    headers: { Authorization: `Bearer ${token}` },
   });
-  return res.data;
+  return res.data; // [{ ID, GroupID, NextCapture }, ...]
 }
 
-// ─────────────────────────────────────────────
-//  Status einer einzelnen Fabrik bestimmen
-//  Gibt zurück: 'attackable' | 'under_attack' | 'protected'
-// ─────────────────────────────────────────────
-function getFactoryStatus(factory) {
-  const now       = Math.floor(Date.now() / 1000);
-  const capture   = NEXT_CAPTURE;
-  const underAtk  = factory.UnderAttack ?? factory.underAttack ?? false;
-
-  if (underAtk) return 'under_attack';
-  if (now >= capture) return 'attackable';
-  return 'protected';
-}
-
-// ─────────────────────────────────────────────
-//  Status-Embed bauen
-// ─────────────────────────────────────────────
-function buildStatusEmbed(factories) {
+// ── Embed ─────────────────────────────────────────────────────────────────────
+function buildEmbed(factories) {
   const now = Math.floor(Date.now() / 1000);
 
-  const embed = new EmbedBuilder()
-    .setTitle('🏭  Fabrik-Übersicht · VioV')
-    .setColor(0x2b2d31)
-    .setTimestamp()
-    .setFooter({ text: 'Aktualisiert jede Minute' });
-
-  if (!factories || factories.length === 0) {
-    embed.setDescription('Keine Fabriken gefunden.');
-    return embed;
-  }
-
   const lines = factories.map(f => {
-    const status = getFactoryStatus(f);
-    const name   = f.Name ?? f.name ?? `Fabrik #${f.ID ?? f.id}`;
-
-    let icon, statusText;
-
-    if (status === 'attackable') {
-      icon       = '✅';
-      statusText = '**Attackierbar!**';
-    } else if (status === 'under_attack') {
-      icon       = '🟠';
-      statusText = '**Wird gerade attackiert!**';
-    } else {
-      icon       = '🔴';
-      statusText = `Attackierbar <t:${NEXT_CAPTURE}:R> (<t:${NEXT_CAPTURE}:f>)`;
+    const id = f.ID ?? f.id;
+    const ts = f.NextCapture ?? f.nextCapture;
+    if (now >= ts) {
+      return `✅  **Fabrik ${id}** — Attackierbar`;
     }
-
-    return `${icon}  **${name}** — ${statusText}`;
+    return `🔴  **Fabrik ${id}** — Attackierbar <t:${ts}:R>`;
   });
 
-  embed.setDescription(lines.join('\n'));
-  return embed;
+  return new EmbedBuilder()
+    .setTitle('🏭  Fabrik-Übersicht')
+    .setDescription(lines.length > 0 ? lines.join('\n') : 'Eure Gruppierung besitzt momentan keine Fabriken :(')
+    .setColor(0x2b2d31)
+    .setFooter({ text: 'Aktualisiert jede Minute' })
+    .setTimestamp();
 }
 
-// ─────────────────────────────────────────────
-//  Angriffs-Alert senden (@everyone)
-// ─────────────────────────────────────────────
+// ── Alert ─────────────────────────────────────────────────────────────────────
 async function sendAttackAlert(channel, factory) {
-  const name = factory.Name ?? factory.name ?? `Fabrik #${factory.ID ?? factory.id}`;
+  const id = factory.ID ?? factory.id;
+  const ts = factory.NextCapture ?? factory.nextCapture;
   const alert = new EmbedBuilder()
     .setTitle('🚨  FABRIK WIRD ATTACKIERT!')
-    .setColor(Colors.Orange)
-    .setDescription(`**${name}** wird gerade angegriffen!`)
-    .addFields(
-      { name: 'NextCapture', value: `<t:${NEXT_CAPTURE}:f>`, inline: true }
-    )
+    .setDescription(`**Fabrik ${id}** wird gerade attackiert!`)
+    .addFields({ name: 'NextCapture', value: `<t:${ts}:f>`, inline: true })
+    .setColor(Colors.Red)
     .setTimestamp();
 
   await channel.send({ content: '@everyone', embeds: [alert] });
 }
 
-// ─────────────────────────────────────────────
-//  Haupt-Poll-Funktion (läuft jede Minute)
-// ─────────────────────────────────────────────
+// ── Cleanup ───────────────────────────────────────────────────────────────────
+async function clearOldBotMessages(channel) {
+  const messages = await channel.messages.fetch({ limit: 100 });
+  const botMsgs  = messages.filter(m => m.author.id === client.user.id);
+  if (botMsgs.size === 0) return;
+
+  const cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000;
+  const bulk   = botMsgs.filter(m => m.createdTimestamp > cutoff);
+  const stale  = botMsgs.filter(m => m.createdTimestamp <= cutoff);
+
+  if (bulk.size > 1)        await channel.bulkDelete(bulk);
+  else if (bulk.size === 1) await bulk.first().delete();
+
+  for (const [, msg] of stale) await msg.delete().catch(() => {});
+
+  console.log(`[Cleanup] ${botMsgs.size} Nachricht(en) gelöscht.`);
+}
+
+// ── Poll ──────────────────────────────────────────────────────────────────────
 async function poll() {
+  const channel = client.channels.cache.get(process.env.DISCORD_CHANNEL_ID);
+  if (!channel) return console.error('[Poll] Channel nicht gefunden!');
+
+  let factories;
   try {
-    const factories = await fetchFactories();
-    const channel   = client.channels.cache.get(process.env.DISCORD_CHANNEL_ID);
-    if (!channel) return console.error('[Poll] Channel nicht gefunden!');
+    factories = await fetchFactories();
+  } catch (err) {
+    return console.error('[Poll] API-Fehler:', err.response?.data ?? err.message);
+  }
 
-    for (const factory of factories) {
-      const id        = factory.ID ?? factory.id;
-      const underAtk  = factory.UnderAttack ?? factory.underAttack ?? false;
-      const prev      = factoryState.get(id) ?? { underAttack: false };
+  for (const f of factories) {
+    const id   = f.ID ?? f.id;
+    const ts   = f.NextCapture ?? f.nextCapture;
+    const prev = knownState.get(id);
 
-      if (underAtk && !prev.underAttack) {
-        await sendAttackAlert(channel, factory);
-      }
-
-      factoryState.set(id, { underAttack: underAtk });
+    // Alert nur wenn NextCapture sich verändert hat UND der neue Wert in der
+    // Zukunft liegt → Fabrik wurde attackiert, Timer wurde neu gesetzt
+    const now = Math.floor(Date.now() / 1000);
+    if (prev !== undefined && ts !== prev.ts && ts > now) {
+      await sendAttackAlert(channel, f).catch(console.error);
     }
 
-    const embed = buildStatusEmbed(factories);
+    knownState.set(id, { ts });
+  }
 
+  const embed = buildEmbed(factories);
+  try {
     if (statusMessage) {
       await statusMessage.edit({ embeds: [embed] });
     } else {
       statusMessage = await channel.send({ embeds: [embed] });
     }
-
+    lastSuccessfulPoll = Date.now();
   } catch (err) {
-    console.error('[Poll] Fehler:', err.response?.data ?? err.message);
+    console.error('[Embed] Fehler beim Aktualisieren:', err.message);
+    try {
+      const owner = await client.users.fetch(process.env.DISCORD_OWNER_ID);
+      for (let i = 0; i < 3; i++) {
+        await channel.send(`<@${owner.id}> ⚠️ Restarte den Bot – ein Fehler ist aufgetreten!`);
+      }
+    } catch (pingErr) {
+      console.error('[Embed] Owner konnte nicht gepingt werden:', pingErr.message);
+    }
   }
 }
 
-// ─────────────────────────────────────────────
-//  Alte Bot-Nachrichten im Channel löschen
-// ─────────────────────────────────────────────
-async function clearOldBotMessages(channel) {
-  try {
-    const messages = await channel.messages.fetch({ limit: 100 });
-    const botMsgs  = messages.filter(m => m.author.id === client.user.id);
- 
-    if (botMsgs.size === 0) {
-      console.log('[Cleanup] Keine alten Nachrichten gefunden.');
+// ── Start ─────────────────────────────────────────────────────────────────────
+client.once('clientReady', async () => {
+  console.log(`[Bot] Eingeloggt als ${client.user.tag}`);
+
+  const channel = client.channels.cache.get(process.env.DISCORD_CHANNEL_ID);
+  if (channel) await clearOldBotMessages(channel).catch(console.error);
+
+  await poll();
+  setInterval(poll, 60_000);
+
+  // Watchdog: prüft alle 2 Minuten ob der letzte Poll nicht länger als 5 Minuten her ist
+  setInterval(async () => {
+    const staleSince = Date.now() - lastSuccessfulPoll;
+    if (staleSince < 5 * 60 * 1000) {
+      ownerPinged = false; // Reset wenn alles wieder normal läuft
       return;
     }
- 
-    const now      = Date.now();
-    const bulk     = botMsgs.filter(m => now - m.createdTimestamp < 14 * 24 * 60 * 60 * 1000);
-    const old      = botMsgs.filter(m => now - m.createdTimestamp >= 14 * 24 * 60 * 60 * 1000);
- 
-    if (bulk.size > 1) {
-      await channel.bulkDelete(bulk);
-    } else if (bulk.size === 1) {
-      await bulk.first().delete();
-    }
- 
-    for (const [, msg] of old) {
-      await msg.delete().catch(() => {});
-    }
- 
-    console.log(`[Cleanup] ${botMsgs.size} alte Nachricht(en) gelöscht.`);
-  } catch (err) {
-    console.error('[Cleanup] Fehler beim Löschen:', err.message);
-  }
-}
+    if (ownerPinged) return; // Nicht mehrfach pingen
 
-// ─────────────────────────────────────────────
-//  Bot ready
-// ─────────────────────────────────────────────
-client.once('ready', async () => {
-  console.log(`[Bot] Eingeloggt als ${client.user.tag}`);
- 
-  const channel = client.channels.cache.get(process.env.DISCORD_CHANNEL_ID);
-  if (channel) {
-    await clearOldBotMessages(channel);
-  } else {
-    console.error('[Bot] Channel nicht gefunden – überprüfe DISCORD_CHANNEL_ID in .env');
-  }
- 
-  await poll();
- 
-  setInterval(poll, 60_000);
+    console.error(`[Watchdog] Kein erfolgreicher Poll seit ${Math.floor(staleSince / 60000)} Minuten!`);
+    try {
+      const ch = client.channels.cache.get(process.env.DISCORD_CHANNEL_ID);
+      if (ch) {
+        for (let i = 0; i < 3; i++) {
+          await ch.send(`<@${process.env.DISCORD_OWNER_ID}> ⚠️ Restarte den Bot – ein Fehler ist aufgetreten! (Kein Update seit ${Math.floor(staleSince / 60000)} Minuten)`);
+        }
+        ownerPinged = true;
+      }
+    } catch (err) {
+      console.error('[Watchdog] Ping fehlgeschlagen:', err.message);
+    }
+  }, 2 * 60 * 1000);
 });
 
 client.login(process.env.DISCORD_BOT_TOKEN);
